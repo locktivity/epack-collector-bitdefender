@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -42,6 +43,7 @@ type Client struct {
 	baseURL    string // e.g. https://cloud.gravityzone.bitdefender.com/api
 	authHeader string
 	httpClient *http.Client
+	retryDelay func(attempt int) time.Duration // defaults to backoff; override in tests
 }
 
 // New creates a Client. baseURL is the Control Center API base URL
@@ -54,6 +56,7 @@ func New(baseURL, apiKey string) *Client {
 		baseURL:    strings.TrimRight(baseURL, "/"),
 		authHeader: "Basic " + token,
 		httpClient: &http.Client{Timeout: 30 * time.Second},
+		retryDelay: backoff,
 	}
 }
 
@@ -79,7 +82,9 @@ type rpcResponse struct {
 
 // call issues one JSON-RPC 2.0 request against the given API service (e.g.
 // "network", "quarantine/computers") and decodes the result into out. out
-// may be nil for methods with no meaningful result.
+// may be nil for methods with no meaningful result. Retries on transient
+// HTTP errors (429, 5xx) and JSON-RPC rate-limit errors with exponential
+// backoff.
 func (c *Client) call(ctx context.Context, service, method string, params any, out any) error {
 	body, err := json.Marshal(rpcRequest{ID: "1", JSONRPC: "2.0", Method: method, Params: params})
 	if err != nil {
@@ -87,6 +92,27 @@ func (c *Client) call(ctx context.Context, service, method string, params any, o
 	}
 
 	url := fmt.Sprintf("%s/v1.0/jsonrpc/%s", c.baseURL, service)
+
+	var lastErr error
+	for attempt := range maxAttempts {
+		err := c.doCall(ctx, url, method, body, out)
+		if err == nil {
+			return nil
+		}
+
+		if !isCallRetryable(err) {
+			return err
+		}
+
+		lastErr = err
+		if sleepErr := sleep(ctx, c.retryDelay(attempt)); sleepErr != nil {
+			return sleepErr
+		}
+	}
+	return fmt.Errorf("max retries exceeded for %s: %w", method, lastErr)
+}
+
+func (c *Client) doCall(ctx context.Context, url, method string, body []byte, out any) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("building request for %s: %w", method, err)
@@ -100,33 +126,59 @@ func (c *Client) call(ctx context.Context, service, method string, params any, o
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode == http.StatusTooManyRequests {
-		return fmt.Errorf("%w: %s", ErrRateLimited, method)
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		if isRetryable(resp.StatusCode) {
+			return &retryableError{
+				msg: fmt.Sprintf("HTTP %d calling %s: %s", resp.StatusCode, method, string(respBody)),
+			}
+		}
+		return fmt.Errorf("HTTP %d calling %s: %s", resp.StatusCode, method, string(respBody))
 	}
 
 	var rr rpcResponse
 	if decErr := json.NewDecoder(resp.Body).Decode(&rr); decErr != nil {
-		return fmt.Errorf("decoding response for %s (status %d): %w", method, resp.StatusCode, decErr)
+		return fmt.Errorf("decoding response for %s: %w", method, decErr)
 	}
 
 	if rr.Error != nil {
-		switch rr.Error.Code {
-		case codeAuthorization:
-			return fmt.Errorf("%w: %s: %s", ErrPermissionDenied, method, rr.Error.Data.Details)
-		case codeNotFound:
-			return fmt.Errorf("%w: %s: %s", ErrNotFound, method, rr.Error.Data.Details)
-		case codeRateLimited:
-			return fmt.Errorf("%w: %s", ErrRateLimited, method)
-		default:
-			return fmt.Errorf("bitdefender API error %d calling %s: %s", rr.Error.Code, method, rr.Error.Message)
-		}
+		return classifyRPCError(method, rr.Error)
 	}
 
-	if out == nil || len(rr.Result) == 0 {
+	if out == nil {
+		return nil
+	}
+	if len(rr.Result) == 0 || string(rr.Result) == "null" {
 		return nil
 	}
 	if err := json.Unmarshal(rr.Result, out); err != nil {
 		return fmt.Errorf("decoding result for %s: %w", method, err)
 	}
 	return nil
+}
+
+type retryableError struct {
+	msg string
+}
+
+func (e *retryableError) Error() string { return e.msg }
+
+func classifyRPCError(method string, rpcErr *rpcError) error {
+	switch rpcErr.Code {
+	case codeAuthorization:
+		return fmt.Errorf("%w: %s: %s", ErrPermissionDenied, method, rpcErr.Data.Details)
+	case codeNotFound:
+		return fmt.Errorf("%w: %s: %s", ErrNotFound, method, rpcErr.Data.Details)
+	case codeRateLimited:
+		return &retryableError{
+			msg: fmt.Sprintf("%s: %s", ErrRateLimited.Error(), method),
+		}
+	default:
+		return fmt.Errorf("bitdefender API error %d calling %s: %s", rpcErr.Code, method, rpcErr.Message)
+	}
+}
+
+func isCallRetryable(err error) bool {
+	var re *retryableError
+	return errors.As(err, &re)
 }
