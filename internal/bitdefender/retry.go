@@ -22,10 +22,6 @@ func isRetryable(statusCode int) bool {
 	return retryableStatuses[statusCode]
 }
 
-func isRetryableRPC(code int) bool {
-	return code == codeRateLimited
-}
-
 func backoff(attempt int) time.Duration {
 	base := math.Pow(2, float64(attempt))
 	jitter := rand.Float64() * base * 0.5

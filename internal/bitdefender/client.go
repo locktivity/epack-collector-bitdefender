@@ -124,7 +124,7 @@ func (c *Client) doCall(ctx context.Context, url, method string, body []byte, ou
 	if err != nil {
 		return fmt.Errorf("calling %s: %w", method, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
