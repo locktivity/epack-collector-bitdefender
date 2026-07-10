@@ -1,0 +1,27 @@
+# Binary (at repo root only)
+/epack-collector-bitdefender
+/epack-collector-bitdefender.exe
+
+# Go
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+go.work
+go.work.sum
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# GoReleaser
+dist/
