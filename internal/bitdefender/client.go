@@ -11,28 +11,19 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
-	"time"
+
+	"github.com/locktivity/epack/componentsdk"
 )
 
-// ErrPermissionDenied is returned when the API key isn't authorized for the
-// requested API (JSON-RPC error code -32001, "Authorization error").
-var ErrPermissionDenied = errors.New("permission denied")
-
-// ErrNotFound is returned when a request references a resource that
-// doesn't exist (JSON-RPC error code -32002, "Resource not found").
-var ErrNotFound = errors.New("not found")
-
-// ErrRateLimited is returned on HTTP 429 or JSON-RPC error code -32003
-// ("Too many requests"). GravityZone allows a limited number of requests
-// per second per API key; see
-// https://www.bitdefender.com/business/support/en/77209-125277-public-api.html#UUID-...-api-rate-limits
-var ErrRateLimited = errors.New("rate limited")
-
-// JSON-RPC error codes GravityZone uses, per its Public API reference.
+// JSON-RPC error codes GravityZone documents beyond the JSON-RPC 2.0 ones
+// (-32700, -32600, -32601, -32602). Each comes in an HTTP 200 response
+// except -32003, which comes with HTTP 429.
 const (
+	codeServerError   = -32000
 	codeAuthorization = -32001
 	codeNotFound      = -32002
 	codeRateLimited   = -32003
@@ -43,21 +34,35 @@ type Client struct {
 	baseURL    string // e.g. https://cloud.gravityzone.bitdefender.com/api
 	authHeader string
 	httpClient *http.Client
-	retryDelay func(attempt int) time.Duration // defaults to backoff; override in tests
 }
 
-// New creates a Client. baseURL is the Control Center API base URL
-// (region- or on-premises-specific, without a trailing slash requirement).
-// apiKey is used as the HTTP Basic auth username with an empty password, as
+// New creates a Client that sends its calls through httpClient. baseURL is
+// the Control Center API base URL (region- or on-premises-specific). apiKey
+// is used as the HTTP Basic auth username with an empty password, as
 // GravityZone's API requires.
-func New(baseURL, apiKey string) *Client {
+func New(httpClient *http.Client, baseURL, apiKey string) *Client {
 	token := base64.StdEncoding.EncodeToString([]byte(apiKey + ":"))
 	return &Client{
 		baseURL:    strings.TrimRight(baseURL, "/"),
 		authHeader: "Basic " + token,
-		httpClient: &http.Client{Timeout: 30 * time.Second},
-		retryDelay: backoff,
+		httpClient: httpClient,
 	}
+}
+
+// Host returns the host of baseURL, the only host that may receive the API
+// key, or "" when baseURL names none.
+func Host(baseURL string) string {
+	u, err := url.Parse(baseURL)
+	if err != nil {
+		return ""
+	}
+	return strings.ToLower(u.Hostname())
+}
+
+// OperationName names the calls to one JSON-RPC method of one API service,
+// such as "bitdefender.network.getEndpointsList", in the run's call ledger.
+func OperationName(service, method string) string {
+	return "bitdefender." + strings.ReplaceAll(service, "/", ".") + "." + method
 }
 
 type rpcRequest struct {
@@ -80,42 +85,122 @@ type rpcResponse struct {
 	Error  *rpcError       `json:"error"`
 }
 
-// call issues one JSON-RPC 2.0 request against the given API service (e.g.
-// "network", "quarantine/computers") and decodes the result into out. out
-// may be nil for methods with no meaningful result. Retries on transient
-// HTTP errors (429, 5xx) and JSON-RPC rate-limit errors with exponential
-// backoff.
-func (c *Client) call(ctx context.Context, service, method string, params any, out any) error {
-	body, err := json.Marshal(rpcRequest{ID: "1", JSONRPC: "2.0", Method: method, Params: params})
-	if err != nil {
-		return fmt.Errorf("encoding request for %s: %w", method, err)
-	}
-
-	url := fmt.Sprintf("%s/v1.0/jsonrpc/%s", c.baseURL, service)
-
-	var lastErr error
-	for attempt := range maxAttempts {
-		err := c.doCall(ctx, url, method, body, out)
-		if err == nil {
-			return nil
-		}
-
-		if !isCallRetryable(err) {
-			return err
-		}
-
-		lastErr = err
-		if sleepErr := sleep(ctx, c.retryDelay(attempt)); sleepErr != nil {
-			return sleepErr
-		}
-	}
-	return fmt.Errorf("max retries exceeded for %s: %w", method, lastErr)
+// APIError is a GravityZone answer that carries no result: an HTTP status
+// other than 200, or a JSON-RPC error object.
+type APIError struct {
+	Method string
+	Status int
+	Header http.Header
+	// RPCCode is the JSON-RPC error code, or 0 when the response had none.
+	RPCCode int
+	Message string
+	Details string
 }
 
-func (c *Client) doCall(ctx context.Context, url, method string, body []byte, out any) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+func (e *APIError) Error() string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "GravityZone %s", e.Method)
+	if e.Status != http.StatusOK {
+		fmt.Fprintf(&b, " returned HTTP %d", e.Status)
+	}
+	if e.RPCCode != 0 {
+		fmt.Fprintf(&b, " error %d %s", e.RPCCode, e.Message)
+		if e.Details != "" {
+			fmt.Fprintf(&b, ": %s", e.Details)
+		}
+	}
+	return b.String()
+}
+
+// HTTPStatus, HTTPHeader, and VendorCode let componentsdk.Classify read the
+// status and throttle headers, and give records the JSON-RPC error code.
+func (e *APIError) HTTPStatus() int         { return e.Status }
+func (e *APIError) HTTPHeader() http.Header { return e.Header }
+func (e *APIError) VendorCode() string {
+	if e.RPCCode == 0 {
+		return ""
+	}
+	return strconv.Itoa(e.RPCCode)
+}
+
+// rpcCode is the code for a JSON-RPC error that came in an HTTP 200
+// response: the code of the HTTP status the error stands in for.
+func rpcCode(code int) componentsdk.Code {
+	switch code {
+	case codeAuthorization:
+		return componentsdk.CodePermissionDenied
+	case codeRateLimited:
+		return componentsdk.CodeRateLimited
+	case codeServerError:
+		return componentsdk.CodeVendorError
+	default:
+		return componentsdk.CodeInvalidResponse
+	}
+}
+
+// ClassifyResponse gives a JSON-RPC error in an HTTP 200 response its code,
+// so the SDK's transport retries a throttle or a server error there as it
+// would a 429 or a 5xx. Other statuses keep the code their status gives.
+// Pass it as componentsdk.HTTPOptions.ClassifyResponse with ClassifySuccess
+// set.
+func ClassifyResponse(resp *http.Response, body []byte) (componentsdk.Code, bool) {
+	if resp.StatusCode != http.StatusOK {
+		return "", false
+	}
+	var rr struct {
+		Error *rpcError `json:"error"`
+	}
+	if json.Unmarshal(body, &rr) != nil || rr.Error == nil {
+		return "", false
+	}
+	return rpcCode(rr.Error.Code), true
+}
+
+// rpcErrorCode returns the JSON-RPC error code of an error GravityZone sent
+// in an HTTP 200 response, or 0 for any other error.
+func rpcErrorCode(err error) int {
+	var apiErr *APIError
+	if errors.As(err, &apiErr) && apiErr.Status == http.StatusOK {
+		return apiErr.RPCCode
+	}
+	return 0
+}
+
+// NotFound reports whether GravityZone answered that a resource the call
+// named does not exist or is not accessible.
+func NotFound(err error) bool {
+	return rpcErrorCode(err) == codeNotFound
+}
+
+// Permission returns the API a GravityZone API key must have enabled to call
+// a service, as getApiKeyDetails lists it in enabledApis, such as "network".
+// The General API's getApiKeyDetails needs none, so its service returns "".
+func Permission(service string) string {
+	switch {
+	case service == "network":
+		return "network"
+	case strings.HasPrefix(service, "quarantine/"):
+		return "quarantine"
+	}
+	return ""
+}
+
+// call sends one JSON-RPC 2.0 request to an API service (such as "network"
+// or "quarantine/computers") at an API version (such as "v1.0") and decodes
+// the result into out. Every method this client calls only reads, so each
+// call is marked safe to retry, and the SDK's transport retries it. Errors
+// built from the response carry the call, so each gap recorded from one
+// includes the operation and, for a denial, the API the key lacks.
+func (c *Client) call(ctx context.Context, version, service, method string, params, out any) error {
+	body, err := json.Marshal(rpcRequest{ID: "1", JSONRPC: "2.0", Method: method, Params: params})
 	if err != nil {
-		return fmt.Errorf("building request for %s: %w", method, err)
+		return fmt.Errorf("encoding the request for %s: %w", method, err)
+	}
+	ctx = componentsdk.WithOperation(ctx, componentsdk.Operation{Name: OperationName(service, method), Safe: true, Permission: Permission(service)})
+	endpoint := c.baseURL + "/" + version + "/jsonrpc/" + service
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("building the request for %s: %w", method, err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", c.authHeader)
@@ -126,59 +211,34 @@ func (c *Client) doCall(ctx context.Context, url, method string, body []byte, ou
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
-		if isRetryable(resp.StatusCode) {
-			return &retryableError{
-				msg: fmt.Sprintf("HTTP %d calling %s: %s", resp.StatusCode, method, string(respBody)),
-			}
-		}
-		return fmt.Errorf("HTTP %d calling %s: %s", resp.StatusCode, method, string(respBody))
-	}
-
 	var rr rpcResponse
-	if decErr := json.NewDecoder(resp.Body).Decode(&rr); decErr != nil {
-		return fmt.Errorf("decoding response for %s: %w", method, decErr)
+	decodeErr := json.NewDecoder(resp.Body).Decode(&rr)
+	if resp.StatusCode != http.StatusOK {
+		apiErr := &APIError{Method: method, Status: resp.StatusCode, Header: resp.Header}
+		if decodeErr == nil && rr.Error != nil {
+			apiErr.RPCCode, apiErr.Message, apiErr.Details = rr.Error.Code, rr.Error.Message, rr.Error.Data.Details
+		}
+		return componentsdk.ResponseError(resp, apiErr)
 	}
-
+	if decodeErr != nil {
+		return componentsdk.ResponseError(resp, fmt.Errorf("decoding the response to %s: %w", method, decodeErr))
+	}
 	if rr.Error != nil {
-		return classifyRPCError(method, rr.Error)
-	}
-
-	if out == nil {
-		return nil
+		apiErr := &APIError{Method: method, Status: resp.StatusCode, Header: resp.Header,
+			RPCCode: rr.Error.Code, Message: rr.Error.Message, Details: rr.Error.Data.Details}
+		return componentsdk.ResponseError(resp, componentsdk.CodeError(rpcCode(rr.Error.Code), apiErr))
 	}
 	if len(rr.Result) == 0 || string(rr.Result) == "null" {
-		return nil
+		return componentsdk.ResponseError(resp, invalidResponse(method, "has no result"))
 	}
 	if err := json.Unmarshal(rr.Result, out); err != nil {
-		return fmt.Errorf("decoding result for %s: %w", method, err)
+		return componentsdk.ResponseError(resp, fmt.Errorf("decoding the result of %s: %w", method, err))
 	}
 	return nil
 }
 
-type retryableError struct {
-	msg string
-}
-
-func (e *retryableError) Error() string { return e.msg }
-
-func classifyRPCError(method string, rpcErr *rpcError) error {
-	switch rpcErr.Code {
-	case codeAuthorization:
-		return fmt.Errorf("%w: %s: %s", ErrPermissionDenied, method, rpcErr.Data.Details)
-	case codeNotFound:
-		return fmt.Errorf("%w: %s: %s", ErrNotFound, method, rpcErr.Data.Details)
-	case codeRateLimited:
-		return &retryableError{
-			msg: fmt.Sprintf("%s: %s", ErrRateLimited.Error(), method),
-		}
-	default:
-		return fmt.Errorf("bitdefender API error %d calling %s: %s", rpcErr.Code, method, rpcErr.Message)
-	}
-}
-
-func isCallRetryable(err error) bool {
-	var re *retryableError
-	return errors.As(err, &re)
+// invalidResponse reports a response that lacks what the collector reads
+// from it.
+func invalidResponse(method, problem string) error {
+	return componentsdk.CodeError(componentsdk.CodeInvalidResponse, fmt.Errorf("the response to %s %s", method, problem))
 }
