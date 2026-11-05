@@ -2,6 +2,8 @@ module github.com/locktivity/epack-collector-bitdefender
 
 go 1.26.0
 
+toolchain go1.26.10
+
 require github.com/locktivity/epack v0.10.0
 
 require (
