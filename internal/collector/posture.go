@@ -1,6 +1,10 @@
 // Package collector collects Bitdefender GravityZone endpoint compliance
 // posture at three cumulative levels (trust / audit / internal), following
 // the same collection-level convention as epack-collector-github.
+//
+// A value the collector could not read is null or absent, and the run's
+// collector result records why. docs/schema/v1.0.0.json describes the
+// artifact.
 package collector
 
 // EndpointPosture is the root of the collected artifact.
@@ -20,17 +24,28 @@ type EndpointPosture struct {
 	Policies   *Policies   `json:"policies,omitempty"`
 
 	Diagnostics Diagnostics `json:"diagnostics"`
+
+	// normalized is the endpoint-posture artifact built in the same pass. It
+	// is not serialized.
+	normalized *Normalized
+}
+
+// Normalized returns the evidencepack/endpoint-posture@v1 artifact built
+// with the posture, or nil when the run does not collect it.
+func (p *EndpointPosture) Normalized() *Normalized {
+	return p.normalized
 }
 
 // Scope describes what was in scope for this run.
 type Scope struct {
-	// TotalManagedComputers is the count of GravityZone-managed endpoints
-	// with machineType "computer" (physical or virtual desktop/laptop).
-	// GravityZone's API does not distinguish laptop vs. desktop form
-	// factor; this collector treats "computer" endpoints (as opposed to
-	// EC2 instances or "other" device types) as the closest available
-	// proxy for "laptop". See docs/levels.md.
-	TotalManagedComputers int `json:"total_managed_computers"`
+	// TotalManagedComputers is the count of GravityZone endpoints with
+	// machineType "computer" (physical or virtual desktop/laptop), with or
+	// without the GravityZone agent, from getEndpointsList and the Active
+	// Directory folder together. GravityZone's API does not distinguish
+	// laptop vs. desktop form factor; this collector treats "computer"
+	// endpoints (as opposed to EC2 instances or "other" device types) as the
+	// closest available proxy for "laptop". See docs/levels.md.
+	TotalManagedComputers *int `json:"total_managed_computers"`
 }
 
 // ComplianceSummary is the trust-level org-wide signal.
@@ -42,32 +57,33 @@ type Scope struct {
 // agent is not flagged out of date. See docs/levels.md for the exact
 // definition and how it can be adjusted.
 type ComplianceSummary struct {
-	CompliancePercentage float64 `json:"compliance_percentage"`
-	CompliantCount       int     `json:"compliant_count"`
-	NonCompliantCount    int     `json:"non_compliant_count"`
+	CompliancePercentage *float64 `json:"compliance_percentage"`
+	CompliantCount       *int     `json:"compliant_count"`
+	NonCompliantCount    *int     `json:"non_compliant_count"`
 }
 
 // Endpoints is the per-computer inventory (audit+).
 type Endpoints struct {
-	PerEndpoint      []EndpointRow `json:"per_endpoint,omitempty"`
+	PerEndpoint      []EndpointRow `json:"per_endpoint"`
 	Truncated        bool          `json:"truncated,omitempty"`
 	TruncatedDropped int           `json:"truncated_dropped,omitempty"`
 }
 
-// EndpointRow is one managed computer.
+// EndpointRow is one computer.
 //
-// Audit has the name and the three booleans behind the trust-level
-// compliance percentage (so a reviewer can see *why* a machine is flagged
+// Audit has the name and the signals behind the trust-level compliance
+// percentage (so a reviewer can see *why* a machine is flagged
 // non-compliant, not just the aggregate). Internal adds the last successful
 // scan. Per-endpoint policy assignment and enabled modules live on the
 // separate Policies surface (internal-only), and quarantine activity lives
-// on the separate Quarantine surface (internal-only) — see below.
+// on the separate Quarantine surface (internal-only).
 type EndpointRow struct {
 	Name            string `json:"name"`
 	OperatingSystem string `json:"operating_system,omitempty"`
-	Compliant       bool   `json:"compliant"`
-	PolicyApplied   bool   `json:"policy_applied"`
-	ProductOutdated bool   `json:"product_outdated"`
+	Managed         *bool  `json:"managed,omitempty"`
+	Compliant       *bool  `json:"compliant"`
+	PolicyApplied   *bool  `json:"policy_applied,omitempty"`
+	ProductOutdated *bool  `json:"product_outdated,omitempty"`
 
 	// Internal-only.
 	LastScanName string `json:"last_scan_name,omitempty"`
@@ -77,7 +93,7 @@ type EndpointRow struct {
 // Quarantine is the per-computer quarantine inventory (internal-only).
 type Quarantine struct {
 	TotalCount       int             `json:"total_count"`
-	PerComputer      []QuarantineRow `json:"per_computer,omitempty"`
+	PerComputer      []QuarantineRow `json:"per_computer"`
 	Truncated        bool            `json:"truncated,omitempty"`
 	TruncatedDropped int             `json:"truncated_dropped,omitempty"`
 }
@@ -93,7 +109,7 @@ type Quarantine struct {
 type QuarantineRow struct {
 	Computer     string `json:"computer"`
 	ThreatName   string `json:"threat_name"`
-	ActionStatus int    `json:"action_status"`
+	ActionStatus *int   `json:"action_status,omitempty"`
 	Date         string `json:"date,omitempty"`
 	FileName     string `json:"file_name,omitempty"`
 	FilePathHash string `json:"file_path_hash,omitempty"`
@@ -105,19 +121,20 @@ type QuarantineRow struct {
 // effect, plus which protection modules that policy has turned on for the
 // endpoint.
 type Policies struct {
-	PerEndpoint []EndpointPolicyRow `json:"per_endpoint,omitempty"`
+	PerEndpoint []EndpointPolicyRow `json:"per_endpoint"`
 }
 
 // EndpointPolicyRow is one computer's policy assignment and enabled
 // modules. ModulesEnabled lists only modules currently reported as
-// enabled (e.g. "antimalware", "firewall", "deviceControl") — the module
+// enabled (e.g. "antimalware", "firewall", "deviceControl"); the module
 // names are whatever GravityZone's getManagedEndpointDetails API returns.
+// A computer without the GravityZone agent has none.
 type EndpointPolicyRow struct {
 	Computer       string   `json:"computer"`
 	PolicyID       string   `json:"policy_id,omitempty"`
 	PolicyName     string   `json:"policy_name,omitempty"`
-	Applied        bool     `json:"applied"`
-	ModulesEnabled []string `json:"modules_enabled,omitempty"`
+	Applied        *bool    `json:"applied,omitempty"`
+	ModulesEnabled []string `json:"modules_enabled"`
 }
 
 // Diagnostics records permission problems and other non-fatal warnings

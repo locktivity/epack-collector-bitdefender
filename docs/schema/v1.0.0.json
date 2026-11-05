@@ -1,0 +1,198 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/locktivity/epack-collector-bitdefender/docs/schema/v1.0.0.json",
+  "title": "Bitdefender GravityZone Endpoint Compliance Posture",
+  "description": "Endpoint compliance posture collected from Bitdefender GravityZone Control Center (artifacts/bitdefender.details.json). A value the collector could not read is null or absent, and the collector result artifact records why.",
+  "comment": "Fields marked x-epack-level audit are present at audit and internal; fields marked internal are present only at internal.",
+  "type": "object",
+  "required": ["collected_at_level", "scope", "compliance", "diagnostics"],
+  "additionalProperties": false,
+  "properties": {
+    "collected_at_level": {
+      "type": "string",
+      "enum": ["trust", "audit", "internal"],
+      "description": "Collection level this artifact was produced at. Levels are cumulative: audit is a superset of trust, internal of audit.",
+      "x-epack-label": "Collection level",
+      "x-epack-summary": "The detail level this artifact was collected at. It is trust, audit, or internal."
+    },
+    "scope": {
+      "type": "object",
+      "description": "What was in scope for the run",
+      "x-epack-label": "Scope",
+      "x-epack-summary": "What was in scope for this collection run.",
+      "required": ["total_managed_computers"],
+      "additionalProperties": false,
+      "properties": {
+        "total_managed_computers": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "x-epack-rollup": {"rows": "/endpoints/per_endpoint", "truncated": "/endpoints/truncated"},
+          "description": "Endpoints GravityZone reports with machineType 1 (a physical or virtual computer), with or without the GravityZone agent, under parent_group_id or the whole company. It includes the computers in the Active Directory folder, each endpoint ID once",
+          "x-epack-label": "Computers in scope",
+          "x-epack-summary": "Physical and virtual computers in the company or the configured group, including those synced from Active Directory. It includes computers without the GravityZone agent.",
+          "x-epack-method": "Lists every endpoint in the company or the configured group and the groups below it, adds the endpoints in the Active Directory folder, and counts the distinct endpoint IDs with machineType 1."
+        }
+      }
+    },
+    "compliance": {
+      "type": "object",
+      "description": "Org-wide compliance across the computers in scope. A computer is compliant when it has the GravityZone agent, its assigned policy is applied, and its agent is not out of date.",
+      "x-epack-label": "Compliance",
+      "x-epack-summary": "Endpoint compliance across the computers in scope.",
+      "required": ["compliance_percentage", "compliant_count", "non_compliant_count"],
+      "additionalProperties": false,
+      "properties": {
+        "compliance_percentage": {
+          "type": ["number", "null"],
+          "minimum": 0,
+          "maximum": 100,
+          "x-epack-denominator": "/scope/total_managed_computers",
+          "x-epack-rollup": {"rows": "/endpoints/per_endpoint", "where": "/compliant", "as": "pct", "truncated": "/endpoints/truncated"},
+          "description": "Percentage of computers in scope that are compliant, rounded to two decimal places",
+          "x-epack-label": "Compliance percentage",
+          "x-epack-summary": "Share of computers in scope that are compliant. A computer counts when its GravityZone agent is up to date and its assigned policy is applied.",
+          "x-epack-goal": "higher",
+          "x-epack-method": "Divides the compliant count by the computers in scope, as a percentage rounded to two decimal places."
+        },
+        "compliant_count": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "x-epack-rollup": {"rows": "/endpoints/per_endpoint", "where": "/compliant", "truncated": "/endpoints/truncated"},
+          "description": "Computers in scope that are compliant",
+          "x-epack-label": "Compliant count",
+          "x-epack-summary": "Computers in scope that are compliant. A computer counts when its GravityZone agent is up to date and its assigned policy is applied.",
+          "x-epack-method": "Counts the computers whose endpoint list row has isManaged and policy.applied true and productOutdated false."
+        },
+        "non_compliant_count": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "x-epack-rollup": {"rows": "/endpoints/per_endpoint", "where": "/compliant", "equals": false, "truncated": "/endpoints/truncated"},
+          "description": "Computers in scope that are not compliant",
+          "x-epack-label": "Non-compliant count",
+          "x-epack-summary": "Computers in scope that are not compliant. This includes computers without the GravityZone agent.",
+          "x-epack-goal": "lower",
+          "x-epack-method": "Subtracts the compliant count from the computers in scope."
+        }
+      }
+    },
+    "endpoints": {
+      "type": "object",
+      "x-epack-level": "audit",
+      "description": "Per-computer inventory with the signals behind the compliance percentage",
+      "x-epack-label": "Endpoints",
+      "x-epack-summary": "One row per computer in scope, with the values behind the compliance percentage.",
+      "required": ["per_endpoint"],
+      "additionalProperties": false,
+      "properties": {
+        "per_endpoint": {
+          "type": "array",
+          "description": "One row per computer in scope, up to 20,000 rows, non-compliant rows first when the cap applies",
+          "x-epack-label": "Per-endpoint rows",
+          "x-epack-summary": "One row per computer in scope, up to 20,000 rows.",
+          "items": {
+            "type": "object",
+            "required": ["name", "compliant"],
+            "additionalProperties": false,
+            "properties": {
+              "name": {"type": "string", "description": "Endpoint name", "x-epack-label": "Name", "x-epack-summary": "Computer name."},
+              "operating_system": {"type": "string", "description": "Operating system version", "x-epack-label": "OS", "x-epack-summary": "Operating system version."},
+              "managed": {"type": "boolean", "description": "True when the computer has the GravityZone agent (isManaged)", "x-epack-label": "GravityZone agent", "x-epack-summary": "Whether the computer has the GravityZone agent installed.", "x-epack-goal": true},
+              "compliant": {"type": ["boolean", "null"], "description": "Whether the computer is compliant; null when GravityZone left out a field the answer needs", "x-epack-label": "Compliant", "x-epack-summary": "Whether the computer's GravityZone agent is up to date and its assigned policy is applied. It is null when the endpoint list is missing one of these values.", "x-epack-goal": true},
+              "policy_applied": {"type": "boolean", "description": "True when the assigned policy has reached the computer (policy.applied). Absent when GravityZone reports no policy, as for a computer without the agent.", "x-epack-label": "Policy applied", "x-epack-summary": "Whether the assigned security policy has reached the computer.", "x-epack-goal": true},
+              "product_outdated": {"type": "boolean", "description": "True when the agent is missing one or more updates (productOutdated). Absent when GravityZone does not report it, as for a computer without the agent.", "x-epack-label": "Product outdated", "x-epack-summary": "Whether the GravityZone agent is missing one or more updates.", "x-epack-goal": false},
+              "last_scan_name": {"type": "string", "x-epack-level": "internal", "description": "Name of the last successful scan", "x-epack-label": "Last scan", "x-epack-summary": "Name of the computer's last successful scan."},
+              "last_scan_date": {"type": "string", "x-epack-level": "internal", "description": "Date of the last successful scan", "x-epack-label": "Last scan date", "x-epack-summary": "When the computer's last successful scan ran."}
+            }
+          }
+        },
+        "truncated": {"type": "boolean", "description": "True when rows past the 20,000 cap were dropped", "x-epack-label": "Rows cut short", "x-epack-summary": "Whether computers past the 20,000-row cap were left out of the rows. The counts still cover every computer."},
+        "truncated_dropped": {"type": "integer", "minimum": 0, "description": "Rows dropped by the cap", "x-epack-label": "Rows left out", "x-epack-summary": "Computers left out of the rows by the 20,000-row cap."}
+      }
+    },
+    "quarantine": {
+      "type": "object",
+      "x-epack-level": "internal",
+      "description": "Quarantined items from the Quarantine API's computers service",
+      "x-epack-label": "Quarantine",
+      "x-epack-summary": "Quarantined items on the company's computers.",
+      "required": ["total_count", "per_computer"],
+      "additionalProperties": false,
+      "properties": {
+        "total_count": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Quarantined items across the whole company and every machine type, including items on endpoints outside the run's scope",
+          "x-epack-label": "Total quarantine items",
+          "x-epack-summary": "Quarantined items across the whole company and every machine type. This includes endpoints outside the configured group."
+        },
+        "per_computer": {
+          "type": ["array", "null"],
+          "description": "Quarantined items on computers in scope, up to 20,000 rows",
+          "x-epack-label": "Quarantined items on computers",
+          "x-epack-summary": "Quarantined items on computers in scope, up to 20,000 rows.",
+          "items": {
+            "type": "object",
+            "required": ["computer", "threat_name"],
+            "additionalProperties": false,
+            "properties": {
+              "computer": {"type": "string", "description": "Name of the computer the item was quarantined on", "x-epack-label": "Computer", "x-epack-summary": "Name of the computer the item was quarantined on."},
+              "threat_name": {"type": "string", "x-epack-label": "Threat name", "x-epack-summary": "Name of the detected threat."},
+              "action_status": {"type": "integer", "description": "GravityZone's raw action status code", "x-epack-label": "Action status code", "x-epack-summary": "GravityZone's raw action status code for the item. Each code's meaning is in Bitdefender's API reference."},
+              "date": {"type": "string", "description": "When the item was quarantined (quarantinedOn)", "x-epack-label": "Quarantined at", "x-epack-summary": "When the item was quarantined."},
+              "file_name": {"type": "string", "description": "Base name of the quarantined file", "x-epack-label": "File name", "x-epack-summary": "Base name of the quarantined file, without its directory."},
+              "file_path_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$", "description": "SHA-256 of the quarantined file's full path, which is never emitted", "x-epack-label": "File path hash", "x-epack-summary": "SHA-256 of the quarantined file's full path. The path itself is never written."}
+            }
+          }
+        },
+        "truncated": {"type": "boolean", "description": "True when rows past the 20,000 cap were dropped", "x-epack-label": "Rows cut short", "x-epack-summary": "Whether items past the 20,000-row cap were left out of the rows."},
+        "truncated_dropped": {"type": "integer", "minimum": 0, "description": "Rows dropped by the cap", "x-epack-label": "Rows left out", "x-epack-summary": "Quarantined items left out of the rows by the 20,000-row cap."}
+      }
+    },
+    "policies": {
+      "type": "object",
+      "x-epack-level": "internal",
+      "description": "Assigned policy and enabled protection modules per computer",
+      "x-epack-label": "Policies",
+      "x-epack-summary": "Each computer's assigned policy and enabled protection modules.",
+      "required": ["per_endpoint"],
+      "additionalProperties": false,
+      "properties": {
+        "per_endpoint": {
+          "type": "array",
+          "description": "One row per computer in scope",
+          "x-epack-label": "Per-endpoint policies",
+          "x-epack-summary": "One row per computer in scope.",
+          "items": {
+            "type": "object",
+            "required": ["computer", "modules_enabled"],
+            "additionalProperties": false,
+            "properties": {
+              "computer": {"type": "string", "x-epack-label": "Computer", "x-epack-summary": "Computer name."},
+              "policy_id": {"type": "string", "x-epack-label": "Policy ID", "x-epack-summary": "ID of the assigned GravityZone policy."},
+              "policy_name": {"type": "string", "x-epack-label": "Policy name", "x-epack-summary": "Name of the assigned GravityZone security policy."},
+              "applied": {"type": "boolean", "description": "True when the assigned policy has reached the computer", "x-epack-label": "Applied", "x-epack-summary": "Whether the assigned policy has reached the computer.", "x-epack-goal": true},
+              "modules_enabled": {
+                "type": ["array", "null"],
+                "description": "Protection modules GravityZone reports as enabled on the computer, empty for a computer without the agent",
+                "x-epack-label": "Modules enabled",
+                "x-epack-summary": "Protection modules enabled on the computer, such as antimalware and firewall. A computer without the GravityZone agent has none.",
+                "items": {"type": "string"}
+              }
+            }
+          }
+        }
+      }
+    },
+    "diagnostics": {
+      "type": "object",
+      "description": "Permission problems and other non-fatal warnings, kept for readers that parse them. The collector result records the same problems by value.",
+      "x-epack-label": "Diagnostics",
+      "x-epack-summary": "Permission errors and other warnings from the run.",
+      "additionalProperties": false,
+      "properties": {
+        "permission_errors": {"type": "array", "items": {"type": "string"}, "x-epack-label": "Permission errors", "x-epack-summary": "Sections left out because the API key lacks the GravityZone API they need."},
+        "warnings": {"type": "array", "items": {"type": "string"}, "x-epack-label": "Warnings", "x-epack-summary": "Problems during the run that left out part of a section."}
+      }
+    }
+  }
+}
