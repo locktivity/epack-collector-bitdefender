@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- The collector is built on Go 1.26.11.
+
 ## v0.2.0
 
 - The collector is built on epack v0.10.0. The detailed artifact moves from `artifacts/bitdefender.json` to `artifacts/bitdefender.details.json`, the path epack's `ArtifactPath` gives it. A reader of the old path needs the new one
