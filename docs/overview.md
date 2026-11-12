@@ -18,6 +18,20 @@ See [docs/levels.md](levels.md) for exactly what's included at each collection l
 how this collector defines "compliant" (GravityZone's Network API has no single native
 compliance-percentage field).
 
+## Not Collected
+
+GravityZone offers the following through its Public API, and the collector does not read them.
+
+- **Missing patches.** GravityZone Patch Management lists the patches each endpoint is
+  missing, with their CVEs. Patch Management is a GravityZone add-on. The collector writes no
+  `vuln-scanning` file.
+- **Control Center user accounts.** GravityZone's Accounts API lists the user accounts that
+  sign in to Control Center and the role of each. It also says whether an account signs in
+  through an identity provider and whether it has two-factor authentication on. The collector
+  writes no `access-posture` file.
+- **Incidents.** GravityZone's Incidents API lists the incidents GravityZone raised, with each
+  one's status and priority. It needs a GravityZone license with access to incidents.
+
 ## Use Cases
 
 - **Endpoint security evidence**: demonstrate AV/EDR coverage and policy enforcement for
