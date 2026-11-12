@@ -189,6 +189,41 @@ func TestInventoryEndpointWithoutMachineTypeIsInvalid(t *testing.T) {
 	}
 }
 
+// A version 1.1 page without hasMoreRecords does not say whether the list
+// goes on, so the read fails rather than stop at that page.
+func TestPageWithoutHasMoreRecordsIsInvalid(t *testing.T) {
+	reads := map[string]func(*Client) error{
+		"getEndpointsList": func(c *Client) error {
+			_, err := c.ListEndpoints(context.Background(), "", false)
+			return err
+		},
+		"getNetworkInventoryItems folder search": func(c *Client) error {
+			_, err := c.FindActiveDirectoryFolders(context.Background())
+			return err
+		},
+		"getNetworkInventoryItems folder list": func(c *Client) error {
+			_, err := c.ListInventoryEndpoints(context.Background(), "ad-1", false)
+			return err
+		},
+	}
+	for name, read := range reads {
+		t.Run(name, func(t *testing.T) {
+			c, calls := testServer(t, func(rpcCall) (int, any) {
+				return http.StatusOK, result(map[string]any{"page": 1, "perPage": 100, "total": 2, "pagesCount": 2, "items": []map[string]any{
+					{"id": "ep-1", "name": "Active Directory", "type": 4, "machineType": 1},
+				}})
+			})
+			err := read(c)
+			if got := componentsdk.Classify(err); got != componentsdk.CodeInvalidResponse {
+				t.Errorf("code = %s, want invalid_response (error %v)", got, err)
+			}
+			if len(*calls) != 1 {
+				t.Errorf("calls = %d, want 1", len(*calls))
+			}
+		})
+	}
+}
+
 func TestDetailsReadTheAgentAndLastSeen(t *testing.T) {
 	c, _ := testServer(t, func(rpcCall) (int, any) {
 		return http.StatusOK, result(map[string]any{

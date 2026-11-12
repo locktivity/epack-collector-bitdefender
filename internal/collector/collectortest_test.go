@@ -72,9 +72,15 @@ func answering(responses []collectortest.Response, op, match, body string) []col
 	return out
 }
 
+// kitModulesReason is why a module getManagedEndpointDetails leaves out is
+// not installed.
+const kitModulesReason = "GravityZone's getManagedEndpointDetails reference describes modules as the modules installed on the endpoint and their statuses, so a module it leaves out is not installed: https://www.bitdefender.com/business/support/en/77209-128484-getmanagedendpointdetails.html"
+
 func TestCollectorKit(t *testing.T) {
 	clean := kitResponses(kitCleanTenant())
 	noFolder := kitResult(inventoryPage([]map[string]any{{"id": "grp-ad-servers", "name": "Active Directory Servers", "type": 4}}, 1, 1, 1))
+	firstPage := kitCleanTenant().endpointPages[0]
+	noMoreRecords := kitResult(map[string]any{"page": 1, "perPage": 100, "total": 6, "pagesCount": 2, "items": firstPage})
 	collectortest.Run(t, collectortest.Suite{
 		Spec:    Spec("test", "collectortest"),
 		Run:     Run,
@@ -260,7 +266,8 @@ func TestCollectorKit(t *testing.T) {
 			{
 				// GravityZone leaves bob-laptop's productOutdated out of its
 				// row and carol-laptop's license and signature state out of
-				// her details.
+				// her details. The antimalware health share is left out, and
+				// its counts keep carol-laptop as unknown.
 				Name:      "agent state not reported",
 				Responses: kitResponses(kitTenantWithoutAgentState()),
 				Expect: map[string]map[string]any{
@@ -271,10 +278,56 @@ func TestCollectorKit(t *testing.T) {
 						"/endpoints/per_endpoint/1/compliant": nil,
 					},
 					normalizedPath: {
-						"/protection/antimalware_healthy_pct":                                      25,
+						"/protection/antimalware_installed_pct":                                    80,
+						"/protection/antimalware_healthy_pct":                                      collectortest.Absent,
 						"/metric_coverage/protection.antimalware_healthy_pct/unknown_device_count": 1,
 						"/devices/2/controls/antimalware_healthy/state":                            "unknown",
 						"/devices/2/protection_modules/0/healthy":                                  collectortest.Absent,
+					},
+				},
+			},
+			{
+				// carol-laptop's modules list neither the antimalware module
+				// nor the EDR sensor, so neither is installed.
+				Name:      "modules not installed",
+				Responses: kitResponses(kitTenantWithoutModules()),
+				Expect: map[string]map[string]any{
+					artifactPath: {
+						"/policies/per_endpoint/2/modules_enabled": []string{"advancedThreatControl"},
+					},
+					normalizedPath: {
+						"/protection/antimalware_installed_pct": 60,
+						"/protection/antimalware_healthy_pct":   20,
+						"/protection/edr_installed_pct":         40,
+						"/metric_coverage/protection.edr_installed_pct": map[string]any{
+							"passing_device_count": 2, "failing_device_count": 3, "unknown_device_count": 0, "not_applicable_device_count": 0,
+						},
+						"/devices/2/controls/antimalware_installed/state": "fail",
+						"/devices/2/controls/antimalware_healthy/state":   "fail",
+						"/devices/2/controls/edr_installed/state":         "fail",
+						"/devices/2/protection_modules":                   []string{},
+					},
+				},
+			},
+			{
+				// A page of getEndpointsList without hasMoreRecords does not
+				// say whether more pages follow, so every value built from
+				// the list is left out.
+				Name:      "endpoint page without hasMoreRecords",
+				Responses: answering(clean, opEndpoints, `"page":1`, noMoreRecords),
+				Expect: map[string]map[string]any{
+					artifactPath: {
+						"/scope/total_managed_computers":    nil,
+						"/compliance/compliance_percentage": nil,
+						"/endpoints":                        collectortest.Absent,
+						"/policies":                         collectortest.Absent,
+						"/quarantine/total_count":           4,
+					},
+					normalizedPath: {
+						"/scope/discovery_complete": nil,
+						"/fleet":                    collectortest.Absent,
+						"/protection":               collectortest.Absent,
+						"/devices":                  collectortest.Absent,
 					},
 				},
 			},
@@ -357,5 +410,9 @@ func TestCollectorKit(t *testing.T) {
 		},
 		Operations: []string{opSignIn, opEndpoints, opInventory, opDetails, opQuarantine},
 		Faults:     gravityZoneFaults(),
+		Omissions: []collectortest.Omission{
+			{Operation: opDetails, Field: "/result/modules/edrSensor", Reason: kitModulesReason},
+			{Operation: opDetails, Field: "/result/modules/antimalware", Reason: kitModulesReason},
+		},
 	})
 }

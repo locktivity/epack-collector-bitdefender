@@ -1,8 +1,12 @@
 # Changelog
 
-## Unreleased
+## v0.2.1
 
+- The collector is built on epack v0.11.0.
 - The collector is built on Go 1.26.11.
+- A module missing from a computer's `modules` in `getManagedEndpointDetails` counts as not installed, since GravityZone lists the modules installed on the computer. A computer with no `antimalware` there counts against `protection.antimalware_installed_pct` and `protection.antimalware_healthy_pct`, and one with no `edrSensor` counts against `protection.edr_installed_pct`.
+- When `getManagedEndpointDetails` has no agent license or signature state for a computer, or sends a module as null, each endpoint-posture percentage that needs the value is left out with a `partial` gap that counts those computers. `metric_coverage` counts them as unknown.
+- A page of `getEndpointsList` or `getNetworkInventoryItems` without `hasMoreRecords` fails the read with `invalid_response`, so the values built from that list are left out with a gap.
 
 ## v0.2.0
 

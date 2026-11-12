@@ -63,10 +63,10 @@ type endpointsListOptions struct {
 }
 
 // pagedResult is one page of a version 1.1 list method, which reports
-// hasMoreRecords.
+// hasMoreRecords on every page.
 type pagedResult[T any] struct {
-	HasMoreRecords bool `json:"hasMoreRecords"`
-	Items          *[]T `json:"items"`
+	HasMoreRecords *bool `json:"hasMoreRecords"`
+	Items          *[]T  `json:"items"`
 }
 
 // EndpointFetchCap bounds how many items the collector reads from one list
@@ -75,8 +75,10 @@ const EndpointFetchCap = 50000
 
 // readPages calls method on the Network API's version 1.1 page by page, from
 // page 1, until GravityZone reports no more records. params builds each
-// page's params. A list longer than EndpointFetchCap fails the read rather
-// than be counted in part. what names the list's items in that error.
+// page's params. A page without hasMoreRecords fails the read, since it does
+// not say whether more pages follow. A list longer than EndpointFetchCap
+// fails the read rather than be counted in part. what names the list's items
+// in that error.
 func readPages[T any](ctx context.Context, c *Client, method, what string, params func(page int) any) ([]T, error) {
 	all := []T{}
 	for page := 1; ; page++ {
@@ -87,8 +89,11 @@ func readPages[T any](ctx context.Context, c *Client, method, what string, param
 		if res.Items == nil {
 			return nil, invalidResponse(method, "has no items list")
 		}
+		if res.HasMoreRecords == nil {
+			return nil, invalidResponse(method, "has no hasMoreRecords")
+		}
 		all = append(all, *res.Items...)
-		if !res.HasMoreRecords || len(*res.Items) == 0 {
+		if !*res.HasMoreRecords || len(*res.Items) == 0 {
 			return all, nil
 		}
 		if len(all) >= EndpointFetchCap {
