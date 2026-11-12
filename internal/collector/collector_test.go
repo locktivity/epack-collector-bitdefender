@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/locktivity/epack-collector-bitdefender/internal/bitdefender"
@@ -603,6 +604,46 @@ func TestCollect_DeniedDetailCallLeavesProtectionOut(t *testing.T) {
 	}
 }
 
+// A computer whose details send a module as null, or leave out the license,
+// has an unknown reading for each percentage that needs it. Those
+// percentages are left out with a partial gap over those computers, and
+// metric_coverage counts them as unknown. A percentage every computer has a
+// reading for stays.
+func TestCollect_UnreportedReadingsLeaveThePercentageOut(t *testing.T) {
+	mock := richMock()
+	mock.details["ep-2"].Agent.Licensed = nil
+	mock.details["ep-3"].Modules["antimalware"] = nil
+	p, rec := collectWith(t, mock, componentsdk.LevelAudit)
+	n := p.Normalized()
+
+	for _, tc := range []struct {
+		metric     string
+		pct        Percentage
+		unmeasured int
+		coverage   MetricCoverage
+	}{
+		{"protection.antimalware_installed_pct", n.Protection.AntimalwareInstalledPct, 1, MetricCoverage{Passing: 2, Unknown: 1}},
+		{"protection.antimalware_healthy_pct", n.Protection.AntimalwareHealthyPct, 2, MetricCoverage{Passing: 1, Unknown: 2}},
+	} {
+		if tc.pct.Read {
+			t.Errorf("%s = %+v, want it left out", tc.metric, tc.pct)
+		}
+		g, ok := normalizedGapAt(rec, "/"+strings.ReplaceAll(tc.metric, ".", "/"))
+		if !ok || g.Status != componentsdk.GapPartial || g.Code != componentsdk.CodeInvalidResponse || g.Unmeasured != tc.unmeasured {
+			t.Errorf("gap at %s = %+v, want partial invalid_response over %d computers", tc.metric, g, tc.unmeasured)
+		}
+		if got := n.MetricCoverage[tc.metric]; got != tc.coverage {
+			t.Errorf("metric_coverage[%s] = %+v, want %+v", tc.metric, got, tc.coverage)
+		}
+	}
+	if got := pctValue(t, n.Protection.EDRInstalledPct); got != 66 {
+		t.Errorf("edr_installed_pct = %v, want 66 (2 of 3)", got)
+	}
+	if g, ok := normalizedGapAt(rec, "/protection/edr_installed_pct"); ok {
+		t.Errorf("edr_installed_pct has gap %+v, want none", g)
+	}
+}
+
 // discovery_complete is true for lists read in full and false for a list
 // longer than the collector reads. A failed call leaves it null with the
 // call's gap.
@@ -702,38 +743,48 @@ func TestAntimalwareHealthy(t *testing.T) {
 	}
 	active, expired, pending, none := intPtr(1), intPtr(2), intPtr(0), intPtr(6)
 	current, outdated := boolPtr(false), boolPtr(true)
+	on, off := controlReading{state: statePass}, controlReading{state: stateFail}
+	null := controlReading{state: stateUnknown, unread: "modules.antimalware"}
 	tests := []struct {
 		name        string
-		antimalware string
+		antimalware controlReading
 		agent       *bitdefender.EndpointAgent
-		want        string
+		want        controlReading
 	}{
-		{"on, active license, current signatures", statePass, agent(active, current), statePass},
-		{"module off", stateFail, agent(active, current), stateFail},
-		{"expired license", statePass, agent(expired, current), stateFail},
-		{"license pending authentication", statePass, agent(pending, current), stateFail},
-		{"no license", statePass, agent(none, current), stateFail},
-		{"outdated signatures", statePass, agent(active, outdated), stateFail},
-		{"no agent state", statePass, nil, stateUnknown},
-		{"license not reported", statePass, agent(nil, current), stateUnknown},
-		{"module off and no agent state", stateFail, nil, stateFail},
-		{"module not reported", stateUnknown, agent(active, current), stateUnknown},
-		{"module not reported and license expired", stateUnknown, agent(expired, current), stateFail},
+		{"on, active license, current signatures", on, agent(active, current), on},
+		{"module off or not installed", off, agent(active, current), off},
+		{"expired license", on, agent(expired, current), off},
+		{"license pending authentication", on, agent(pending, current), off},
+		{"no license", on, agent(none, current), off},
+		{"outdated signatures", on, agent(active, outdated), off},
+		{"no agent state", on, nil, controlReading{state: stateUnknown, unread: "agent"}},
+		{"license not reported", on, agent(nil, current), controlReading{state: stateUnknown, unread: "agent.licensed"}},
+		{"signatures not reported", on, agent(active, nil), controlReading{state: stateUnknown, unread: "agent.signatureOutdated"}},
+		{"module off and no agent state", off, nil, off},
+		{"module sent as null", null, agent(active, current), null},
+		{"module sent as null and license expired", null, agent(expired, current), off},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := antimalwareHealthy(tt.antimalware, tt.agent); got != tt.want {
-				t.Errorf("antimalwareHealthy() = %s, want %s", got, tt.want)
+				t.Errorf("antimalwareHealthy() = %+v, want %+v", got, tt.want)
 			}
 		})
 	}
 }
 
+// modules lists the modules installed on a computer, so a module it leaves
+// out is not installed. A module sent as null is unknown.
 func TestModuleState(t *testing.T) {
 	modules := map[string]*bool{"antimalware": boolPtr(true), "edrSensor": boolPtr(false), "firewall": nil}
-	for name, want := range map[string]string{"antimalware": statePass, "edrSensor": stateFail, "firewall": stateUnknown, "deviceControl": stateUnknown} {
+	for name, want := range map[string]controlReading{
+		"antimalware":   {state: statePass},
+		"edrSensor":     {state: stateFail},
+		"firewall":      {state: stateUnknown, unread: "modules.firewall"},
+		"deviceControl": {state: stateFail},
+	} {
 		if got := moduleState(modules, name); got != want {
-			t.Errorf("moduleState(%s) = %s, want %s", name, got, want)
+			t.Errorf("moduleState(%s) = %+v, want %+v", name, got, want)
 		}
 	}
 }

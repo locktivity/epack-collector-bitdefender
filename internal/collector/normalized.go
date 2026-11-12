@@ -3,6 +3,8 @@ package collector
 import (
 	"encoding/json"
 	"fmt"
+	"maps"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -211,7 +213,16 @@ func reasonOf(err error) string {
 }
 
 // reading is one computer's protection readings, by control key.
-type reading map[string]string
+type reading map[string]controlReading
+
+// controlReading is one computer's state for one control. unread names the
+// getManagedEndpointDetails value GravityZone left out, or sent as null,
+// that made the state unknown. An unknown state from a value GravityZone
+// did send would leave unread empty.
+type controlReading struct {
+	state  string
+	unread string
+}
 
 // readingOf returns a computer's protection readings from its endpoint list
 // row and its getManagedEndpointDetails answer. A computer without the agent
@@ -219,7 +230,8 @@ type reading map[string]string
 // the call's error and no reading.
 func readingOf(e bitdefender.Endpoint, details map[string]detailRead) (reading, *bitdefender.EndpointDetail, error) {
 	if e.IsManaged != nil && !*e.IsManaged {
-		return reading{"antimalware_installed": stateFail, "antimalware_healthy": stateFail, "edr_installed": stateFail}, nil, nil
+		fail := controlReading{state: stateFail}
+		return reading{"antimalware_installed": fail, "antimalware_healthy": fail, "edr_installed": fail}, nil, nil
 	}
 	read, ok := details[e.ID]
 	if !ok {
@@ -238,42 +250,50 @@ func readingOf(e bitdefender.Endpoint, details map[string]detailRead) (reading, 
 }
 
 // moduleState is pass for a module GravityZone reports on and fail for one
-// it reports off. A module GravityZone leaves out is unknown.
-func moduleState(modules map[string]*bool, name string) string {
-	on := modules[name]
+// it reports off. GravityZone's modules object lists the modules installed
+// on the computer, so a module it leaves out is not installed and fails. A
+// module sent as null is unknown.
+func moduleState(modules map[string]*bool, name string) controlReading {
+	on, listed := modules[name]
 	switch {
+	case !listed:
+		return controlReading{state: stateFail}
 	case on == nil:
-		return stateUnknown
+		return controlReading{state: stateUnknown, unread: "modules." + name}
 	case *on:
-		return statePass
+		return controlReading{state: statePass}
 	}
-	return stateFail
+	return controlReading{state: stateFail}
 }
 
 // antimalwareHealthy passes a computer when its antimalware module is on
 // with an active license and current signatures. It fails the computer when
 // any one of them is known to be false. Otherwise it is unknown when
 // GravityZone left one of them out.
-func antimalwareHealthy(antimalware string, agent *bitdefender.EndpointAgent) string {
-	license, signatures := stateUnknown, stateUnknown
-	if agent != nil && agent.Licensed != nil {
-		license = passIf(*agent.Licensed == bitdefender.LicenseActive)
-	}
-	if agent != nil && agent.SignatureOutdated != nil {
-		signatures = passIf(!*agent.SignatureOutdated)
-	}
-	states := []string{antimalware, license, signatures}
-	for _, s := range states {
-		if s == stateFail {
-			return stateFail
+func antimalwareHealthy(antimalware controlReading, agent *bitdefender.EndpointAgent) controlReading {
+	license := controlReading{state: stateUnknown, unread: "agent"}
+	signatures := license
+	if agent != nil {
+		license.unread, signatures.unread = "agent.licensed", "agent.signatureOutdated"
+		if agent.Licensed != nil {
+			license = controlReading{state: passIf(*agent.Licensed == bitdefender.LicenseActive)}
+		}
+		if agent.SignatureOutdated != nil {
+			signatures = controlReading{state: passIf(!*agent.SignatureOutdated)}
 		}
 	}
-	for _, s := range states {
-		if s == stateUnknown {
-			return stateUnknown
+	readings := []controlReading{antimalware, license, signatures}
+	for _, r := range readings {
+		if r.state == stateFail {
+			return controlReading{state: stateFail}
 		}
 	}
-	return statePass
+	for _, r := range readings {
+		if r.state == stateUnknown {
+			return r
+		}
+	}
+	return controlReading{state: statePass}
 }
 
 func passIf(ok bool) string {
@@ -347,8 +367,8 @@ func protectionModules(d *bitdefender.EndpointDetail, r reading) []ProtectionMod
 		}
 		enabled := *on
 		row := ProtectionModule{Kind: m.kind, Enabled: &enabled}
-		if m.kind == "antimalware" && r["antimalware_healthy"] != stateUnknown {
-			healthy := r["antimalware_healthy"] == statePass
+		if state := r["antimalware_healthy"].state; m.kind == "antimalware" && state != stateUnknown {
+			healthy := state == statePass
 			row.Healthy = &healthy
 		}
 		modules = append(modules, row)
@@ -427,7 +447,9 @@ func (c *Collector) recordIncompleteDiscovery(p *collectionPass, n *Normalized, 
 }
 
 // applyFleet writes the fleet totals and the protection percentages. The
-// percentages are left out when any computer's details were not read.
+// percentages are left out when any computer's details were not read. A
+// percentage is also left out when a computer's answer left out a value it
+// needs, and metric_coverage counts that computer as unknown.
 func (c *Collector) applyFleet(p *collectionPass, n *Normalized, computers []bitdefender.Endpoint, audit bool) {
 	total := len(computers)
 	present := total > 0
@@ -459,8 +481,10 @@ func (c *Collector) applyFleet(p *collectionPass, n *Normalized, computers []bit
 	}
 
 	coverage := map[string]*MetricCoverage{}
+	unreported := map[string]*unreportedValues{}
 	for _, m := range protectionMetrics {
 		coverage[m.control] = &MetricCoverage{}
+		unreported[m.control] = &unreportedValues{values: map[string]bool{}}
 	}
 	unread := 0
 	var firstErr error
@@ -475,13 +499,16 @@ func (c *Collector) applyFleet(p *collectionPass, n *Normalized, computers []bit
 		}
 		for _, m := range protectionMetrics {
 			cov := coverage[m.control]
-			switch r[m.control] {
+			switch r[m.control].state {
 			case statePass:
 				cov.Passing++
 			case stateFail:
 				cov.Failing++
 			default:
 				cov.Unknown++
+				if value := r[m.control].unread; value != "" {
+					unreported[m.control].add(value)
+				}
 			}
 		}
 	}
@@ -500,18 +527,20 @@ func (c *Collector) applyFleet(p *collectionPass, n *Normalized, computers []bit
 			continue
 		}
 		cov := *coverage[m.control]
-		evaluated := cov.Passing + cov.Failing
-		if total > 0 && evaluated == 0 {
-			err := componentsdk.CodeError(componentsdk.CodeInvalidResponse,
-				fmt.Errorf("no computer's getManagedEndpointDetails answer has the module state %s needs", m.path))
-			c.rec.NotCollected(nloc(m.pointer), err)
-			n.Availability = append(n.Availability, Availability{Path: m.path, Reason: reasonSourceError})
-			if audit {
-				c.rec.NotCollected(nloc("/metric_coverage/"+m.path), err)
-			}
+		if audit {
+			n.MetricCoverage[m.path] = cov
+		}
+		// The schema leaves an unknown computer out of the share. When
+		// GravityZone left out a value the reading needs, the computer is a
+		// failed read instead, as for a failed detail call, so the share is
+		// left out.
+		if u := unreported[m.control]; u.computers > 0 {
+			err := u.err(total)
+			c.rec.Partial(nloc(m.pointer), u.computers, err)
+			n.Availability = append(n.Availability, Availability{Path: m.path, Reason: reasonOf(err)})
 			continue
 		}
-		pct := percentOf(cov.Passing, evaluated)
+		pct := percentOf(cov.Passing, cov.Passing+cov.Failing)
 		switch m.control {
 		case "antimalware_installed":
 			protection.AntimalwareInstalledPct = pct
@@ -520,13 +549,28 @@ func (c *Collector) applyFleet(p *collectionPass, n *Normalized, computers []bit
 		case "edr_installed":
 			protection.EDRInstalledPct = pct
 		}
-		if audit {
-			n.MetricCoverage[m.path] = cov
-		}
 	}
 	if protection.AntimalwareInstalledPct.Read || protection.AntimalwareHealthyPct.Read || protection.EDRInstalledPct.Read {
 		n.Protection = protection
 	}
+}
+
+// unreportedValues counts the computers whose reading for one control is
+// unknown because getManagedEndpointDetails left out a value it needs, or
+// sent it as null, and names those values.
+type unreportedValues struct {
+	computers int
+	values    map[string]bool
+}
+
+func (u *unreportedValues) add(value string) {
+	u.computers++
+	u.values[value] = true
+}
+
+func (u *unreportedValues) err(total int) error {
+	return componentsdk.CodeError(componentsdk.CodeInvalidResponse, fmt.Errorf("getManagedEndpointDetails gave no %s for %d of %d computers",
+		strings.Join(slices.Sorted(maps.Keys(u.values)), " or "), u.computers, total))
 }
 
 // applyDevices writes one row per computer, up to EndpointsCap rows, ordered
@@ -569,7 +613,7 @@ func (c *Collector) applyDevices(p *collectionPass, n *Normalized, computers []b
 		}
 		row.Controls = map[string]DeviceControl{}
 		for _, m := range protectionMetrics {
-			row.Controls[m.control] = DeviceControl{State: r[m.control]}
+			row.Controls[m.control] = DeviceControl{State: r[m.control].state}
 		}
 		modules := protectionModules(detail, r)
 		row.ProtectionModules = &modules

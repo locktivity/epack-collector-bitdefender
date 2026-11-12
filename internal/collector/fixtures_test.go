@@ -175,6 +175,16 @@ func kitTenantWithoutAgentState() kitTenant {
 	return t
 }
 
+// kitTenantWithoutModules is the clean company with carol-laptop's modules
+// listing neither the antimalware module nor the EDR sensor.
+func kitTenantWithoutModules() kitTenant {
+	t := kitCleanTenant()
+	carol := t.details["ep-3"]
+	carol.Modules = map[string]*bool{"advancedThreatControl": boolPtr(true)}
+	t.details["ep-3"] = carol
+	return t
+}
+
 // kitFleetOverTheRowCap is a company with one computer more than
 // endpoints.per_endpoint holds, every tenth one with an outdated agent.
 func kitFleetOverTheRowCap() kitTenant {

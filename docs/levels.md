@@ -66,7 +66,9 @@ malware-status data already collected per endpoint has what you'd need.
 The endpoint list covers every endpoint under the company, or under
 `parent_group_id`, including its subgroups. It comes from version 1.1 of
 `getEndpointsList`, read page by page until GravityZone reports no more
-records.
+records. A page without `hasMoreRecords` fails the read with
+`invalid_response`, as a page without its items list does, and the values
+built from the list are left out.
 
 Bitdefender's API docs say to read the endpoints in the Active Directory
 folder with `getNetworkInventoryItems`. The collector reads them with version

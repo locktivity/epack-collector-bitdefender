@@ -78,6 +78,10 @@ is antivirus and EDR software, so the file holds only what GravityZone reports.
 - `protection.edr_installed_pct` is the share with the EDR sensor module on.
 - A computer without the agent has no modules, so it counts as not installed and not
   healthy.
+- `getManagedEndpointDetails` lists the modules installed on a computer, so a module its
+  `modules` object leaves out counts as not installed. A computer whose `modules` has no
+  `antimalware` counts as not installed and not healthy, and one with no `edrSensor` counts
+  as not installed.
 
 These values have an `unsupported` gap in the collector result, which does not make a run
 partial:
@@ -98,10 +102,17 @@ status. The report comes from the Reports API, which this collector does not cal
 `availability` reason for disk encryption is `not_read` as well.
 
 A computer whose `getManagedEndpointDetails` call failed has no reading. The protection
-percentages are then left out with the call's code. When an endpoint list or the Active
-Directory folder could not be read in full, the fleet and protection values are left out.
-`scope.discovery_complete` is then false for a list longer than the collector reads, and
-null with the call's gap when a call failed.
+percentages are then left out with the call's code. When the answer has no agent license
+or signature state, or sends a module as null, the computer's reading for each percentage
+that needs it is unknown. Those percentages are left out with a `partial` gap that counts
+the computers, and `metric_coverage` counts them as unknown.
+
+When an endpoint list or the Active Directory folder could not be read in full, the fleet
+and protection values are left out. A page of `getEndpointsList` or
+`getNetworkInventoryItems` without `hasMoreRecords` does not say whether more pages
+follow, so it fails the read with `invalid_response`. `scope.discovery_complete` is false
+for a list longer than the collector reads, and null with the call's gap when a call
+failed.
 
 At the audit level, the file adds the counts behind each percentage in `metric_coverage`
 and one row per computer in `devices`, up to 20,000 rows. A row has the computer's name,
